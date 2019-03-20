@@ -1,130 +1,289 @@
 /*
  * mysqlcap.go
+ *
+ * [Packet Capture, Injection, and Analysis with Gopacket](https://www.devdungeon.com/content/packet-capture-injection-and-analysis-gopacket)
+ * [MySQL Query Sniffer](https://github.com/zorkian/mysql-sniffer)
+ *   This program uses libpcap to capture and analyze packets destined for a MySQL
+ *   server.  With a variety of command line options, you can tune the output to
+ *   show you a variety of outputs, such as:
+ *       * top N queries since you started running the program
+ *       * top N queries every X seconds (sliding window)
+ *       * all queries (sanitized or not)
+ * [go-sniffer](https://github.com/40t/go-sniffer)
+ *   Capture mysql,redis,http,mongodb etc protocol...
+ *   抓包截取项目中的数据库请求并解析成相应的语句，如mysql协议会解析为sql语句,便于调试。
+ *   不要修改代码，直接嗅探项目中的数据请求。
+ * [tidb_sql.go](https://github.com/july2993/tidb_sql)
+ *   use pcap to read packets off the wire about tidb-server(or mysql), and print
+ *   the sql which client send to server in stdout (some log will be print in stderr).
+ *   for the prepared-staytements it will print it in the text-protocol way.
  */
 
 package main
 
 import (
+	"bufio"
+	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
 	"log"
-	"math/rand"
-	"sort"
-	"strings"
+	"strconv"
 	"time"
 
+	"github.com/xiewen/mysqlcap/mysql"
 	"github.com/xiewen/mysqlcap/query"
 
 	_ "github.com/davecgh/go-spew/spew"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
+	"github.com/google/gopacket/tcpassembly"
+	"github.com/google/gopacket/tcpassembly/tcpreader"
 )
 
-const (
-	// Internal tuning
-	timeBuckets = 10000
+var iface = flag.String("i", "eth0", "Interface to get packets from")
+var port = flag.Int("port", 3306, "port of mysql server")
 
-	// ANSI colors
-	colorRED     = "\x1b[31m"
-	colorGREEN   = "\x1b[32m"
-	colorYELLOW  = "\x1b[33m"
-	colorCYAN    = "\x1b[36m"
-	colorWHITE   = "\x1b[37m"
-	colorDEFAULT = "\x1b[39m"
-
-	// MySQL packet types
-	comQUERY = 3
-
-	// These are used for formatting outputs
-	fNONE = iota
-	fQUERY
-	fROUTE
-	fSOURCE
-	fSOURCEIP
-)
+type mysqlStreamFactory struct {
+	source map[string]*mysqlStream
+}
 
 type packet struct {
-	request bool // request or response
-	data    []byte
+	seq     uint8
+	payload []byte
 }
 
-type sortable struct {
-	value float64
-	line  string
-}
-type sortableSlice []sortable
+type mysqlStream struct {
+	net, transport gopacket.Flow
+	r              tcpreader.ReaderStream
 
-type source struct {
-	src       string
-	srcip     string
-	synced    bool
-	reqbuffer []byte
-	resbuffer []byte
-	reqSent   *time.Time
-	reqTimes  [timeBuckets]uint64
-	qbytes    uint64
-	qdata     *queryData
-	qtext     string
+	stmtID2query map[uint32]*mysql.Stmt
+
+	packets chan *packet
 }
 
-type queryData struct {
-	count uint64
-	bytes uint64
-	times [timeBuckets]uint64
-}
-
-func unixNow() int64 {
-	return time.Now().Unix()
-}
-
-var (
-	start      = unixNow()
-	qbuf       = make(map[string]*queryData)
-	querycount int
-	chmap      = make(map[string]*source)
-	verbose    = false
-	noclean    = false
-	dirty      = false
-	format     []interface{}
-	port       uint16
-	times      [timeBuckets]uint64
-)
-
-var stats struct {
-	packets struct {
-		rcvd     uint64
-		rcvdSync uint64
+func (m *mysqlStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream {
+	mstream := &mysqlStream{
+		net:          net,
+		transport:    transport,
+		r:            tcpreader.NewReaderStream(),
+		stmtID2query: make(map[uint32]*mysql.Stmt),
+		packets:      make(chan *packet, 1024),
 	}
-	desyncs uint64
-	streams uint64
+
+	log.Println("new stream ", net, transport)
+	go mstream.readPackets()
+
+	key := fmt.Sprintf("%v:%v", net, transport)
+	revKey := fmt.Sprintf("%v:%v", net.Reverse(), transport.Reverse())
+
+	// server to client stream
+	if transport.Src().String() == strconv.Itoa(*port) {
+		if client, ok := m.source[revKey]; ok {
+			log.Println("run ", revKey)
+			go client.runClient(mstream.packets)
+			delete(m.source, revKey)
+		} else {
+			// wait client stream
+			m.source[key] = mstream
+		}
+	} else { // client to server stream
+		if server, ok := m.source[revKey]; ok {
+			log.Println("run ", key)
+			go mstream.runClient(server.packets)
+			delete(m.source, revKey)
+		} else {
+			// wait server stream
+			m.source[key] = mstream
+		}
+	}
+
+	// ReaderStream implements tcpassembly.Stream, so we can return a pointer to it.
+	return &mstream.r
+}
+
+func (m *mysqlStream) readPackets() {
+	buf := bufio.NewReader(&m.r)
+	for {
+		seq, pk, err := mysql.ReadPacket(buf)
+		if err == io.EOF {
+			log.Println(m.net, m.transport, " leave")
+			close(m.packets)
+			return
+		} else if err != nil {
+			log.Println("Error reading stream", m.net, m.transport, ":", err)
+			close(m.packets)
+		} else {
+			// log.Println("Received package from stream", m.net, m.transport, " seq: ", seq, " pk:", pk)
+		}
+
+		m.packets <- &packet{seq: seq, payload: pk}
+	}
+
+}
+
+// for simplicy, does'n parse server response according to request
+// just skip to the first response packet to try get response stmt_id now
+func skip2Seq(srv chan *packet, seq uint8) *packet {
+	for {
+		select {
+		case pk, ok := <-srv:
+			if !ok {
+				return nil
+			}
+			if pk.seq == seq {
+				return pk
+			}
+		case <-time.After(5 * time.Second):
+			return nil
+		}
+	}
+}
+
+func (m *mysqlStream) handlePacket(seq uint8, payload []byte, srvPackets chan *packet) {
+	// text protocol command can just print it out
+	// https://dev.mysql.com/doc/internals/en/text-protocol.html
+	srvPK := skip2Seq(srvPackets, seq+1)
+	switch payload[0] {
+	// 131, 141 for handkshake
+	// https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::Handshake
+	case 131, 141:
+	// some old client may still use this, print it in sql query way
+	case mysql.COM_INIT_DB:
+		fmt.Printf("use %s;\n", payload[1:])
+	case mysql.COM_DROP_DB:
+		fmt.Printf("DROP DATABASE %s;\n", payload[1:])
+	case mysql.COM_CREATE_DB:
+		fmt.Printf("CREATE DATABASE %s;\n", payload[1:])
+	// just print the query
+	case mysql.COM_QUERY:
+		fmt.Printf("%s;\n", payload[1:])
+		finesql := query.Fingerprint(string(payload[1:]))
+		fineid := query.Id(finesql)
+		fmt.Printf("#%s %s;\n",fineid,finesql)
+
+	// prepare statements
+	// https://dev.mysql.com/doc/internals/en/prepared-statements.html
+	case mysql.COM_STMT_PREPARE:
+		// find the return stmt_id, so we can know which prepare stmt execute later
+		if srvPK == nil {
+			log.Println("can't find resp packet from prepare")
+			return
+		}
+
+		// https://dev.mysql.com/doc/internals/en/com-stmt-prepare-response.html#packet-COM_STMT_PREPARE_OK
+		if srvPK.payload[0] != 0 {
+			log.Println("prepare fail")
+			return
+		}
+
+		stmtID := binary.LittleEndian.Uint32(srvPK.payload[1:5])
+		stmt := &mysql.Stmt{
+			ID:    stmtID,
+			Query: string(payload[1:]),
+		}
+		m.stmtID2query[stmtID] = stmt
+		stmt.Columns = binary.LittleEndian.Uint16(srvPK.payload[5:7])
+		stmt.Params = binary.LittleEndian.Uint16(srvPK.payload[7:9])
+		stmt.Args = make([]interface{}, stmt.Params)
+
+		log.Println("prepare stmt: ", *stmt)
+	case mysql.COM_STMT_SEND_LONG_DATA:
+		// https://dev.mysql.com/doc/internals/en/com-stmt-send-long-data.html
+		stmtID := binary.LittleEndian.Uint32(payload[1:5])
+		paramID := binary.LittleEndian.Uint16(payload[5:7])
+		stmt, ok := m.stmtID2query[stmtID]
+		if !ok {
+			return
+		}
+		if paramID >= stmt.Params {
+			return
+		}
+
+		if stmt.Args[paramID] == nil {
+			stmt.Args[paramID] = payload[7:]
+		} else {
+			if b, ok := stmt.Args[paramID].([]byte); ok {
+				b = append(b, payload[7:]...)
+				stmt.Args[paramID] = b
+			}
+		}
+	case mysql.COM_STMT_RESET:
+		// https://dev.mysql.com/doc/internals/en/com-stmt-reset.html
+		stmtID := binary.LittleEndian.Uint32(payload[1:5])
+		stmt, ok := m.stmtID2query[stmtID]
+		if !ok {
+			return
+		}
+		stmt.Args = make([]interface{}, stmt.Params)
+
+	case mysql.COM_STMT_EXECUTE:
+		// https://dev.mysql.com/doc/internals/en/com-stmt-execute.html
+		idx := 1
+		stmtID := binary.LittleEndian.Uint32(payload[idx : idx+4])
+		idx += 4
+		var stmt *mysql.Stmt
+		var ok bool
+		if stmt, ok = m.stmtID2query[stmtID]; ok == false {
+			log.Println("not found stmt id query: ", stmtID)
+			return
+		}
+		fmt.Printf("# exec prepare stmt:  %s;\n", stmt.Query)
+		// parse params
+		flags := payload[idx]
+		_ = flags
+		idx++
+		// skip iterater_count alwasy 1
+		_ = binary.LittleEndian.Uint32(payload[idx : idx+4])
+		idx += 4
+		if stmt.Params > 0 {
+			len := int((stmt.Params + 7) / 8)
+			nullBitmap := payload[idx : idx+len]
+			idx += len
+
+			newParamsBoundFlag := payload[idx]
+			idx++
+
+			var paramTypes []byte
+			var paramValues []byte
+			if newParamsBoundFlag == 1 {
+				paramTypes = payload[idx : idx+int(stmt.Params)*2]
+				idx += int(stmt.Params) * 2
+				paramValues = payload[idx:]
+			}
+			err := stmt.BindStmtArgs(nullBitmap, paramTypes, paramValues)
+			if err != nil {
+				log.Println("bind args err: ", err)
+				return
+			}
+		}
+		// log.Println("exec smmt: ", *stmt)
+		fmt.Println("# binary exec a prepare stmt rewrite it like: ")
+		fmt.Println(string(stmt.WriteToText()))
+	case mysql.COM_STMT_CLOSE:
+		// https://dev.mysql.com/doc/internals/en/com-stmt-close.html
+		// delete the stmt will not be use any more
+		stmtID := binary.LittleEndian.Uint32(payload[1:5])
+		delete(m.stmtID2query, stmtID)
+	default:
+	}
+}
+
+func (m *mysqlStream) runClient(srv chan *packet) {
+	for packet := range m.packets {
+		m.handlePacket(packet.seq, packet.payload, srv)
+	}
 }
 
 func main() {
-	lport := flag.Int("P", 3306, "MySQL port to use")
-	eth := flag.String("i", "eth0", "Interface to sniff")
-	ldirty := flag.Bool("u", false, "Unsanitized -- do not canonicalize queries")
-	period := flag.Int("t", 10, "Seconds between outputting status")
-	displaycount := flag.Int("d", 15, "Display this many queries in status updates")
-	doverbose := flag.Bool("v", false, "Print every query received (spammy)")
-	nocleanquery := flag.Bool("n", false, "no clean queries")
-	formatstr := flag.String("f", "#s:#q", "Format for output aggregation")
-	sortby := flag.String("s", "count", "Sort by: count, max, avg, maxbytes, avgbytes")
-	cutoff := flag.Int("c", 0, "Only show queries over count/second")
 	flag.Parse()
-
-	verbose = *doverbose
-	noclean = *nocleanquery
-	port = uint16(*lport)
-	dirty = *ldirty
-	parseFormat(*formatstr)
-	rand.Seed(time.Now().UnixNano())
 
 	log.SetPrefix("")
 	log.SetFlags(0)
 
-	log.Printf("Initializing MySQL capture on %s:%d...", *eth, port)
-	handle, err := pcap.OpenLive(*eth, 1024, false, pcap.BlockForever)
+	log.Printf("Initializing MySQL capture on %s:%d...", *iface, *port)
+	handle, err := pcap.OpenLive(*iface, 65535, false, pcap.BlockForever)
 	if handle == nil || err != nil {
 		msg := "unknown error"
 		if err != nil {
@@ -133,391 +292,38 @@ func main() {
 		log.Fatalf("Failed to open device: %s", msg)
 	}
 
-	err = handle.SetBPFFilter(fmt.Sprintf("tcp port %d", port))
+	err = handle.SetBPFFilter(fmt.Sprintf("tcp port %d", *port))
 	if err != nil {
 		log.Fatalf("Failed to set port filter: %s", err.Error())
 	}
-	defer handle.Close()
+	//defer handle.Close()
 
-	last := unixNow()
+	// Set up assembly
+	streamFactory := &mysqlStreamFactory{source: make(map[string]*mysqlStream)}
+	streamPool := tcpassembly.NewStreamPool(streamFactory)
+	assembler := tcpassembly.NewAssembler(streamPool)
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	packetSource.NoCopy = true
-	for packet := range packetSource.Packets() {
-		if packet.NetworkLayer() == nil || packet.TransportLayer() == nil || packet.TransportLayer().LayerType() != layers.LayerTypeTCP {
-			fmt.Println("unexpected packet")
-			continue
-		}
-		handlePacket(packet)
-		// simple output printer... this should be super fast since we expect that a
-		// system like this will have relatively few unique queries once they're
-		// canonicalized.
-		if !verbose && querycount%1000 == 0 && last < unixNow()-int64(*period) {
-			last = unixNow()
-			handleStatusUpdate(*displaycount, *sortby, *cutoff)
-		}
-	}
-}
+	packets := packetSource.Packets()
+	ticker := time.Tick(time.Minute)
 
-func calculateTimes(timings *[timeBuckets]uint64) (fmin, favg, fmax float64) {
-	var counts, total, min, max, avg uint64 = 0, 0, 0, 0, 0
-	hasMin := false
-	for _, val := range *timings {
-		if val == 0 {
-			// Queries should never take 0 nanoseconds. We are using 0 as a
-			// trigger to mean 'uninitialized reading'.
-			continue
-		}
-		if val < min || !hasMin {
-			hasMin = true
-			min = val
-		}
-		if val > max {
-			max = val
-		}
-		counts++
-		total += val
-	}
-	if counts > 0 {
-		avg = total / counts // integer division
-	}
-	return float64(min) / 1000000, float64(avg) / 1000000,
-		float64(max) / 1000000
-}
-
-func handleStatusUpdate(displaycount int, sortby string, cutoff int) {
-	elapsed := float64(unixNow() - start)
-
-	// print status bar
-	log.Printf("\n")
-	log.SetFlags(log.Ldate | log.Ltime)
-	log.Printf("%s%d total queries, %0.2f per second%s", colorRED, querycount,
-		float64(querycount)/elapsed, colorDEFAULT)
-	log.SetFlags(0)
-
-	log.Printf("%d packets (%0.2f%% on synchronized streams) / %d desyncs / %d streams",
-		stats.packets.rcvd, float64(stats.packets.rcvdSync)/float64(stats.packets.rcvd)*100,
-		stats.desyncs, stats.streams)
-
-	// global timing values
-	gmin, gavg, gmax := calculateTimes(&times)
-	log.Printf("%0.2fms min / %0.2fms avg / %0.2fms max query times", gmin, gavg, gmax)
-	log.Printf("%d unique results in this filter", len(qbuf))
-	log.Printf(" ")
-	log.Printf("%s count     %sqps     %s  min    avg   max      %sbytes      per qry%s",
-		colorYELLOW, colorCYAN, colorYELLOW, colorGREEN, colorDEFAULT)
-
-	// we cheat so badly here...
-	tmp := make(sortableSlice, 0, len(qbuf))
-	for q, c := range qbuf {
-		qps := float64(c.count) / elapsed
-		if qps < float64(cutoff) {
-			continue
-		}
-
-		qmin, qavg, qmax := calculateTimes(&c.times)
-		bavg := uint64(float64(c.bytes) / float64(c.count))
-
-		sorted := float64(c.count)
-		if sortby == "avg" {
-			sorted = qavg
-		} else if sortby == "max" {
-			sorted = qmax
-		} else if sortby == "maxbytes" {
-			sorted = float64(c.bytes)
-		} else if sortby == "avgbytes" {
-			sorted = float64(bavg)
-		}
-
-		tmp = append(tmp, sortable{sorted, fmt.Sprintf(
-			"%s%6d  %s%7.2f/s  %s%6.2f %6.2f %6.2f  %s%9db %6db %s%s%s",
-			colorYELLOW, c.count, colorCYAN, qps, colorYELLOW, qmin, qavg, qmax,
-			colorGREEN, c.bytes, bavg, colorWHITE, q, colorDEFAULT)})
-	}
-	sort.Sort(tmp)
-
-	// now print top to bottom, since our sorted list is sorted backwards
-	// from what we want
-	if len(tmp) < displaycount {
-		displaycount = len(tmp)
-	}
-	for i := 1; i <= displaycount; i++ {
-		log.Printf(tmp[len(tmp)-i].line)
-	}
-}
-
-// Do something with a packet for a source.
-func processPacket(rs *source, request bool, data []byte) {
-	//		log.Printf("[%s] request=%t, got %d bytes", rs.src, request,
-	//			len(data))
-
-	stats.packets.rcvd++
-	if rs.synced {
-		stats.packets.rcvdSync++
-	}
-
-	ptype := -1
-	var pdata []byte
-
-	if request {
-		// If we still have response buffer, we're in some weird state and
-		// didn't successfully process the response.
-		if rs.resbuffer != nil {
-			//				log.Printf("[%s] possibly pipelined request? %d bytes",
-			//					rs.src, len(rs.resbuffer))
-			stats.desyncs++
-			rs.resbuffer = nil
-			rs.synced = false
-		}
-		rs.reqbuffer = data
-		ptype, pdata = carvePacket(&rs.reqbuffer)
-	} else {
-		// FIXME: For now we're not doing anything with response data, just using the first packet
-		// after a query to determine latency.
-		rs.resbuffer = nil
-		ptype, pdata = 0, data
-	}
-
-	// The synchronization logic: if we're not presently, then we want to
-	// keep going until we are capable of carving off of a request/query.
-	if !rs.synced {
-		if !(request && ptype == comQUERY) {
-			rs.reqbuffer, rs.resbuffer = nil, nil
-			return
-		}
-		rs.synced = true
-	}
-	//log.Printf("[%s] request=%b ptype=%d plen=%d", rs.src, request, ptype, len(pdata))
-
-	// No (full) packet detected yet. Continue on our way.
-	if ptype == -1 {
-		return
-	}
-	plen := uint64(len(pdata))
-
-	// If this is a response then we want to record the timing and
-	// store it with this channel so we can keep track of that.
-	var reqtime uint64
-	if !request {
-		// Keep adding the bytes we're getting, since this is probably still part of
-		// an earlier response
-		if rs.reqSent == nil {
-			if rs.qdata != nil {
-				rs.qdata.bytes += plen
+	for {
+		select {
+		case packet := <-packets:
+			if packet == nil {
+				return
 			}
-			return
-		}
-		reqtime = uint64(time.Since(*rs.reqSent).Nanoseconds())
-
-		// We keep track of per-source, global, and per-query timings.
-		randn := rand.Intn(timeBuckets)
-		rs.reqTimes[randn] = reqtime
-		times[randn] = reqtime
-		if rs.qdata != nil {
-			// This should never fail but it has. Probably because of a
-			// race condition I need to suss out, or sharing between
-			// two different goroutines. :(
-			rs.qdata.times[randn] = reqtime
-			rs.qdata.bytes += plen
-		}
-		rs.reqSent = nil
-
-		// If we're in verbose mode, just dump statistics from this one.
-		if verbose && len(rs.qtext) > 0 {
-			log.Printf("    %s%s %s## %sbytes: %d time: %0.2f%s\n", colorGREEN, rs.qtext, colorRED,
-				colorYELLOW, rs.qbytes, float64(reqtime)/1000000, colorDEFAULT)
-		}
-
-		return
-	}
-
-	// This is for sure a request, so let's count it as one.
-	if rs.reqSent != nil {
-		//			log.Printf("[%s] ...sending two requests without a response?",
-		//				rs.src)
-	}
-	tnow := time.Now()
-	rs.reqSent = &tnow
-
-	// Convert this request into whatever format the user wants.
-	querycount++
-	var text string
-
-	for _, item := range format {
-		switch item.(type) {
-		case int:
-			switch item.(int) {
-			case fNONE:
-				log.Fatalf("fNONE in format string")
-			case fQUERY, fROUTE:
-				sql := string(pdata)
-				if dirty {
-					text += sql
-				} else {
-					s := query.Fingerprint(sql)
-					text += s
-				}
-			case fSOURCE:
-				text += rs.src
-			case fSOURCEIP:
-				text += rs.srcip
-			default:
-				log.Fatalf("Unknown F_XXXXXX int in format string")
+			// log.Println(packet)
+			if packet.NetworkLayer() == nil || packet.TransportLayer() == nil || packet.TransportLayer().LayerType() != layers.LayerTypeTCP {
+				log.Println("Unusable packet")
+				continue
 			}
-		case string:
-			text += item.(string)
-		default:
-			log.Fatalf("Unknown type in format string")
+			tcp := packet.TransportLayer().(*layers.TCP)
+			assembler.AssembleWithTimestamp(packet.NetworkLayer().NetworkFlow(), tcp, packet.Metadata().Timestamp)
+		case <-ticker:
+			// Every Minus, flush connections that haven't seen activity in the past 2 Minute.
+			assembler.FlushOlderThan(time.Now().Add(time.Minute * -2))
 		}
 	}
-	qdata, ok := qbuf[text]
-	if !ok {
-		qdata = &queryData{}
-		qbuf[text] = qdata
-	}
-	qdata.count++
-	qdata.bytes += plen
-	rs.qtext, rs.qdata, rs.qbytes = text, qdata, plen
-}
-
-// carvePacket tries to pull a packet out of a slice of bytes. If so, it removes
-// those bytes from the slice.
-func carvePacket(buf *[]byte) (int, []byte) {
-	datalen := uint32(len(*buf))
-	if datalen < 5 {
-		return -1, nil
-	}
-
-	size := uint32((*buf)[0]) + uint32((*buf)[1])<<8 + uint32((*buf)[2])<<16
-	if size == 0 || datalen < size+4 {
-		return -1, nil
-	}
-
-	// Else, has some length, try to validate it.
-	end := size + 4
-	ptype := int((*buf)[4])
-	data := (*buf)[5 : size+4]
-	if end >= datalen {
-		*buf = nil
-	} else {
-		*buf = (*buf)[end:]
-	}
-
-	//	log.Printf("datalen=%d size=%d end=%d ptype=%d data=%d buf=%d",
-	//		datalen, size, end, ptype, len(data), len(*buf))
-
-	return ptype, data
-}
-
-// extract the data... we have to figure out where it is, which means extracting data
-// from the various headers until we get the location we want.  this is crude, but
-// functional and it should be fast.
-func handlePacket(packet gopacket.Packet) {
-	// https://www.devdungeon.com/content/packet-capture-injection-and-analysis-gopacket
-	// https://blog.csdn.net/u014762921/article/details/78275428
-	ip := packet.NetworkLayer().(*layers.IPv4)
-	srcIP := ip.SrcIP
-	dstIP := ip.DstIP
-	tcp := packet.TransportLayer().(*layers.TCP)
-	srcPort := tcp.SrcPort
-	dstPort := tcp.DstPort
-	applicationLayer := packet.ApplicationLayer()
-	if applicationLayer == nil {
-		return
-	}
-	// This is either an inbound or outbound packet. Determine by seeing which
-	// end contains our port. Either way, we want to put this on the channel of
-	// the remote end.
-	var src string
-	request := false
-	if srcPort == layers.TCPPort(port) {
-		src = fmt.Sprintf("%s:%d", dstIP, dstPort)
-		//log.Printf("response to %s", src)
-	} else if dstPort == layers.TCPPort(port) {
-		src = fmt.Sprintf("%s:%d", srcIP, srcPort)
-		request = true
-		//log.Printf("request from %s", src)
-	} else {
-		log.Fatalf("got packet src = %d, dst = %d", srcPort, dstPort)
-	}
-
-	// Get the data structure for this source, then do something.
-	rs, ok := chmap[src]
-	if !ok {
-		srcip := src[0:strings.Index(src, ":")]
-		rs = &source{src: src, srcip: srcip, synced: false}
-		stats.streams++
-		chmap[src] = rs
-	}
-
-	// Now with a source, process the packet.
-	processPacket(rs, request, applicationLayer.Payload())
-}
-
-// parseFormat takes a string and parses it out into the given format slice
-// that we later use to build up a string. This might actually be an overcomplicated
-// solution?
-func parseFormat(formatstr string) {
-	formatstr = strings.TrimSpace(formatstr)
-	if formatstr == "" {
-		formatstr = "#b:#k"
-	}
-
-	isSpecial := false
-	curstr := ""
-	doAppend := fNONE
-	for _, char := range formatstr {
-		if char == '#' {
-			if isSpecial {
-				curstr += string(char)
-				isSpecial = false
-			} else {
-				isSpecial = true
-			}
-			continue
-		}
-
-		if isSpecial {
-			switch strings.ToLower(string(char)) {
-			case "s":
-				doAppend = fSOURCE
-			case "i":
-				doAppend = fSOURCEIP
-			case "r":
-				doAppend = fROUTE
-			case "q":
-				doAppend = fQUERY
-			default:
-				curstr += "#" + string(char)
-			}
-			isSpecial = false
-		} else {
-			curstr += string(char)
-		}
-
-		if doAppend != fNONE {
-			if curstr != "" {
-				format = append(format, curstr, doAppend)
-				curstr = ""
-			} else {
-				format = append(format, doAppend)
-			}
-			doAppend = fNONE
-		}
-	}
-	if curstr != "" {
-		format = append(format, curstr)
-	}
-}
-
-func (s sortableSlice) Len() int {
-	return len(s)
-}
-
-func (s sortableSlice) Less(i, j int) bool {
-	return s[i].value < s[j].value
-}
-
-func (s sortableSlice) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
 }
