@@ -1,22 +1,6 @@
 /*
  * mysqlcap.go
  *
- * [Packet Capture, Injection, and Analysis with Gopacket](https://www.devdungeon.com/content/packet-capture-injection-and-analysis-gopacket)
- * [MySQL Query Sniffer](https://github.com/zorkian/mysql-sniffer)
- *   This program uses libpcap to capture and analyze packets destined for a MySQL
- *   server.  With a variety of command line options, you can tune the output to
- *   show you a variety of outputs, such as:
- *       * top N queries since you started running the program
- *       * top N queries every X seconds (sliding window)
- *       * all queries (sanitized or not)
- * [go-sniffer](https://github.com/40t/go-sniffer)
- *   Capture mysql,redis,http,mongodb etc protocol...
- *   抓包截取项目中的数据库请求并解析成相应的语句，如mysql协议会解析为sql语句,便于调试。
- *   不要修改代码，直接嗅探项目中的数据请求。
- * [tidb_sql.go](https://github.com/july2993/tidb_sql)
- *   use pcap to read packets off the wire about tidb-server(or mysql), and print
- *   the sql which client send to server in stdout (some log will be print in stderr).
- *   for the prepared-staytements it will print it in the text-protocol way.
  */
 
 package main
@@ -27,12 +11,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"os"
 	"strconv"
 	"time"
 
 	"github.com/xiewen/mysqlcap/mysql"
-	"github.com/xiewen/mysqlcap/query"
+	"github.com/xiewen/mysqlcap/utils"
 
 	_ "github.com/davecgh/go-spew/spew"
 	"github.com/google/gopacket"
@@ -44,6 +28,8 @@ import (
 
 var iface = flag.String("i", "eth0", "Interface to get packets from")
 var port = flag.Int("port", 3306, "port of mysql server")
+var errLog *utils.ErrLogService
+var sqlLog *utils.SQLLogService
 
 type mysqlStreamFactory struct {
 	source map[string]*mysqlStream
@@ -72,16 +58,20 @@ func (m *mysqlStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Strea
 		packets:      make(chan *packet, 1024),
 	}
 
-	log.Println("new stream ", net, transport)
+	// net: 10.18.69.137->10.18.68.212
+	// transport: 34907->3306
+	errLog.Log(fmt.Sprintf("new stream %s %s", net, transport))
 	go mstream.readPackets()
 
+	// key: 10.18.69.137->10.18.68.212:34907->3306
+	// revKey: 10.18.68.212->10.18.69.137:3306->34907
 	key := fmt.Sprintf("%v:%v", net, transport)
 	revKey := fmt.Sprintf("%v:%v", net.Reverse(), transport.Reverse())
 
 	// server to client stream
 	if transport.Src().String() == strconv.Itoa(*port) {
 		if client, ok := m.source[revKey]; ok {
-			log.Println("run ", revKey)
+			errLog.Log(fmt.Sprintf("run server to client: %s", revKey))
 			go client.runClient(mstream.packets)
 			delete(m.source, revKey)
 		} else {
@@ -90,7 +80,7 @@ func (m *mysqlStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Strea
 		}
 	} else { // client to server stream
 		if server, ok := m.source[revKey]; ok {
-			log.Println("run ", key)
+			errLog.Log(fmt.Sprintf("run client to server: %s", key))
 			go mstream.runClient(server.packets)
 			delete(m.source, revKey)
 		} else {
@@ -108,14 +98,14 @@ func (m *mysqlStream) readPackets() {
 	for {
 		seq, pk, err := mysql.ReadPacket(buf)
 		if err == io.EOF {
-			log.Println(m.net, m.transport, " leave")
+			errLog.Log(fmt.Sprintf("%s %s leave", m.net, m.transport))
 			close(m.packets)
 			return
 		} else if err != nil {
-			log.Println("Error reading stream", m.net, m.transport, ":", err)
+			errLog.Log(fmt.Sprintf("Error reading stream %s %s : %s", m.net, m.transport, err))
 			close(m.packets)
 		} else {
-			// log.Println("Received package from stream", m.net, m.transport, " seq: ", seq, " pk:", pk)
+			// errLog.Log(fmt.Sprintf("Received package from stream %s %s seq: %s pk: %s", m.net, m.transport, seq, pk))
 		}
 
 		m.packets <- &packet{seq: seq, payload: pk}
@@ -151,30 +141,27 @@ func (m *mysqlStream) handlePacket(seq uint8, payload []byte, srvPackets chan *p
 	case 131, 141:
 	// some old client may still use this, print it in sql query way
 	case mysql.COM_INIT_DB:
-		fmt.Printf("use %s;\n", payload[1:])
+		sqlLog.Log("COM_INIT_DB", string(payload[1:]))
 	case mysql.COM_DROP_DB:
-		fmt.Printf("DROP DATABASE %s;\n", payload[1:])
+		sqlLog.Log("COM_DROP_DB", string(payload[1:]))
 	case mysql.COM_CREATE_DB:
-		fmt.Printf("CREATE DATABASE %s;\n", payload[1:])
+		sqlLog.Log("COM_CREATE_DB", string(payload[1:]))
 	// just print the query
 	case mysql.COM_QUERY:
-		fmt.Printf("%s;\n", payload[1:])
-		finesql := query.Fingerprint(string(payload[1:]))
-		fineid := query.Id(finesql)
-		fmt.Printf("#%s %s;\n",fineid,finesql)
+		sqlLog.Log("COM_QUERY", string(payload[1:]))
 
 	// prepare statements
 	// https://dev.mysql.com/doc/internals/en/prepared-statements.html
 	case mysql.COM_STMT_PREPARE:
 		// find the return stmt_id, so we can know which prepare stmt execute later
 		if srvPK == nil {
-			log.Println("can't find resp packet from prepare")
+			errLog.Log("can't find resp packet from prepare")
 			return
 		}
 
 		// https://dev.mysql.com/doc/internals/en/com-stmt-prepare-response.html#packet-COM_STMT_PREPARE_OK
 		if srvPK.payload[0] != 0 {
-			log.Println("prepare fail")
+			errLog.Log("prepare fail")
 			return
 		}
 
@@ -188,7 +175,7 @@ func (m *mysqlStream) handlePacket(seq uint8, payload []byte, srvPackets chan *p
 		stmt.Params = binary.LittleEndian.Uint16(srvPK.payload[7:9])
 		stmt.Args = make([]interface{}, stmt.Params)
 
-		log.Println("prepare stmt: ", *stmt)
+		sqlLog.Log("COM_STMT_PREPARE", stmt.Query)
 	case mysql.COM_STMT_SEND_LONG_DATA:
 		// https://dev.mysql.com/doc/internals/en/com-stmt-send-long-data.html
 		stmtID := binary.LittleEndian.Uint32(payload[1:5])
@@ -226,10 +213,10 @@ func (m *mysqlStream) handlePacket(seq uint8, payload []byte, srvPackets chan *p
 		var stmt *mysql.Stmt
 		var ok bool
 		if stmt, ok = m.stmtID2query[stmtID]; ok == false {
-			log.Println("not found stmt id query: ", stmtID)
+			errLog.Log(fmt.Sprintf("not found stmt id query: %s", stmtID))
 			return
 		}
-		fmt.Printf("# exec prepare stmt:  %s;\n", stmt.Query)
+		//sqlLog.Log("COM_STMT_EXECUTE", "sql", stmt.Query)
 		// parse params
 		flags := payload[idx]
 		_ = flags
@@ -254,13 +241,14 @@ func (m *mysqlStream) handlePacket(seq uint8, payload []byte, srvPackets chan *p
 			}
 			err := stmt.BindStmtArgs(nullBitmap, paramTypes, paramValues)
 			if err != nil {
-				log.Println("bind args err: ", err)
+				errLog.Log(fmt.Sprintf("bind args err: %s", err))
 				return
 			}
 		}
-		// log.Println("exec smmt: ", *stmt)
-		fmt.Println("# binary exec a prepare stmt rewrite it like: ")
-		fmt.Println(string(stmt.WriteToText()))
+		// utils.Logger.Println("exec smmt: ", *stmt)
+		//fmt.Println("# binary exec a prepare stmt rewrite it like: ")
+		//fmt.Println(string(stmt.WriteToText()))
+		sqlLog.Log("COM_STMT_EXECUTE", string(stmt.WriteToText()))
 	case mysql.COM_STMT_CLOSE:
 		// https://dev.mysql.com/doc/internals/en/com-stmt-close.html
 		// delete the stmt will not be use any more
@@ -278,23 +266,24 @@ func (m *mysqlStream) runClient(srv chan *packet) {
 
 func main() {
 	flag.Parse()
+	errLog = utils.NewErrLog()
+	sqlLog = utils.NewSQLLog()
 
-	log.SetPrefix("")
-	log.SetFlags(0)
-
-	log.Printf("Initializing MySQL capture on %s:%d...", *iface, *port)
+	errLog.Log(fmt.Sprintf("Initializing MySQL capture on %s:%d...", *iface, *port))
 	handle, err := pcap.OpenLive(*iface, 65535, false, pcap.BlockForever)
 	if handle == nil || err != nil {
 		msg := "unknown error"
 		if err != nil {
 			msg = err.Error()
 		}
-		log.Fatalf("Failed to open device: %s", msg)
+		errLog.Log(fmt.Sprintf("Failed to open device: %s", msg))
+		os.Exit(1)
 	}
 
 	err = handle.SetBPFFilter(fmt.Sprintf("tcp port %d", *port))
 	if err != nil {
-		log.Fatalf("Failed to set port filter: %s", err.Error())
+		errLog.Log(fmt.Sprintf("Failed to set port filter: %s", err.Error()))
+		os.Exit(1)
 	}
 	//defer handle.Close()
 
@@ -311,12 +300,13 @@ func main() {
 	for {
 		select {
 		case packet := <-packets:
+			// A nil packet indicates the end of a pcap file.
 			if packet == nil {
 				return
 			}
 			// log.Println(packet)
 			if packet.NetworkLayer() == nil || packet.TransportLayer() == nil || packet.TransportLayer().LayerType() != layers.LayerTypeTCP {
-				log.Println("Unusable packet")
+				errLog.Log("Unusable packet")
 				continue
 			}
 			tcp := packet.TransportLayer().(*layers.TCP)
