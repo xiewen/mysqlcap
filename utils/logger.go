@@ -28,19 +28,19 @@ func NewSQLLog() *SQLLogService {
 func (s *SQLLogService) Log(cmd string, txt string) {
 	switch cmd {
 	case "COM_INIT_DB":
-		s.Logger.Log("cmd", "COM_INIT_DB", "sql", fmt.Sprintf("USE %s", txt))
+		s.Logger.Log("cmd", cmd, "sql", fmt.Sprintf("USE %s", txt))
 	case "COM_DROP_DB":
-		s.Logger.Log("cmd", "COM_DROP_DB", "sql", fmt.Sprintf("DROP DATABASE %s", txt))
+		s.Logger.Log("cmd", cmd, "sql", fmt.Sprintf("DROP DATABASE %s", txt))
 	case "COM_CREATE_DB":
-		s.Logger.Log("cmd", "COM_CREATE_DB", "sql", fmt.Sprintf("CREATE DATABASE %s", txt))
+		s.Logger.Log("cmd", cmd, "sql", fmt.Sprintf("CREATE DATABASE %s", txt))
 	case "COM_QUERY":
-		finesql := query.Fingerprint(string(txt))
+		finesql := query.Fingerprint(txt)
 		fineid := query.Id(finesql)
-		s.Logger.Log("cmd", "COM_QUERY", "sql", txt, "finesql", finesql, "fineid", fineid)
+		s.Logger.Log("cmd", cmd, "sql", txt, "finesql", finesql, "fineid", fineid)
 	case "COM_STMT_PREPARE":
-		s.Logger.Log("cmd", "COM_STMT_PREPARE", "sql", txt)
+		s.Logger.Log("cmd", cmd, "sql", txt)
 	case "COM_STMT_EXECUTE":
-		s.Logger.Log("cmd", "COM_STMT_EXECUTE", "sql", txt)
+		s.Logger.Log("cmd", cmd, "sql", txt)
 	}
 }
 

@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/xiewen/mysqlcap/mysql"
@@ -268,6 +270,14 @@ func main() {
 	flag.Parse()
 	errLog = utils.NewErrLog()
 	sqlLog = utils.NewSQLLog()
+	sigs := make(chan os.Signal, 1)
+	exit := make(chan bool, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-sigs
+		errLog.Log(fmt.Sprintf("received signal: %v", sig))
+		exit <- true
+	}()
 
 	errLog.Log(fmt.Sprintf("Initializing MySQL capture on %s:%d...", *iface, *port))
 	handle, err := pcap.OpenLive(*iface, 65535, false, pcap.BlockForever)
@@ -314,6 +324,9 @@ func main() {
 		case <-ticker:
 			// Every Minus, flush connections that haven't seen activity in the past 2 Minute.
 			assembler.FlushOlderThan(time.Now().Add(time.Minute * -2))
+		case <-exit:
+			errLog.Log("exiting")
+			os.Exit(0)
 		}
 	}
 }
