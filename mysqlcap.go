@@ -28,18 +28,143 @@ import (
 	"github.com/google/gopacket/tcpassembly/tcpreader"
 )
 
-var iface = flag.String("i", "eth0", "Interface to get packets from")
-var port = flag.Int("port", 3306, "port of mysql server")
-var errLog *utils.ErrLogService
-var sqlLog *utils.SQLLogService
-
-type mysqlStreamFactory struct {
-	source map[string]*mysqlStream
-}
+var (
+	iface     = flag.String("i", "eth0", "Interface to get packets from")
+	port      = flag.Int("port", 3306, "port of mysql server")
+	errLog    *utils.ErrLogService
+	sqlLog    *utils.SQLLogService
+	maxWorker = utils.GetEnvInt("MAX_WORKERS", 2)
+	maxQueue  = utils.GetEnvInt("MAX_QUEUE", 100)
+)
 
 type packet struct {
 	seq     uint8
 	payload []byte
+}
+
+/* --- workpool --- */
+
+// Payload represents the payload
+type Payload struct {
+	p   *packet
+	m   *mysqlStream
+	srv chan *packet
+}
+
+func (pl *Payload) processPayLoad() {
+	//fmt.Println("process payload:", p.package)
+	//time.Sleep(300 * time.Millisecond)
+	pl.m.handlePacket(pl.p.seq, pl.p.payload, pl.srv)
+}
+
+// Job represents the job to be run
+type Job struct {
+	Payload Payload
+}
+
+// A buffered channel that we can send work requests on.
+var JobQueue chan Job
+
+// Worker represents the worker that executes the job
+type Worker struct {
+	id         int
+	WorkerPool chan Worker
+	JobChannel chan Job
+	quit       chan bool
+}
+
+func NewWorker(workerPool chan Worker, id int) Worker {
+	return Worker{
+		id:         id,
+		WorkerPool: workerPool,
+		JobChannel: make(chan Job),
+		quit:       make(chan bool)}
+}
+
+// Start method starts the run loop for the worker, listening for a quit channel in
+// case we need to stop it
+func (w Worker) Start() {
+	go func() {
+		for {
+			// register the current worker into the worker queue.
+			w.WorkerPool <- w
+			select {
+			case job := <-w.JobChannel:
+				// we have received a work request.
+				job.Payload.processPayLoad()
+			case <-w.quit:
+				// we have received a signal to stop
+				return
+			}
+		}
+	}()
+}
+
+// Stop signals the worker to stop listening for work requests.
+func (w Worker) Stop() {
+	go func() {
+		w.quit <- true
+	}()
+}
+
+type Dispatcher struct {
+	// A pool of workers channels that are registered with the dispatcher
+	WorkerPool chan Worker
+	maxWorkers int
+	Workers    []Worker
+}
+
+func NewDispatcher(maxWorkers int) *Dispatcher {
+	wp := make(chan Worker, maxWorkers)
+	ws := make([]Worker, 0, maxWorkers)
+	return &Dispatcher{WorkerPool: wp, maxWorkers: maxWorkers, Workers: ws}
+}
+
+func (d *Dispatcher) Run() {
+	// starting n number of workers
+	ws := d.Workers
+	for i := 0; i < d.maxWorkers; i++ {
+		errLog.Log(fmt.Sprintf("Start worker %d", i))
+		worker := NewWorker(d.WorkerPool, i)
+		ws = append(ws, worker)
+		worker.Start()
+	}
+	d.Workers = ws
+	errLog.Log("dispatch...")
+	go d.dispatch()
+}
+
+func (d *Dispatcher) Stop() {
+	for _, w := range d.Workers {
+		errLog.Log(fmt.Sprintf("Stop worker %d", w.id))
+		w.Stop()
+	}
+}
+
+func (d *Dispatcher) dispatch() {
+	for {
+		//errLog.Log("waiting for jobQueue ...")
+		select {
+		case job := <-JobQueue:
+			// a job request has been received
+			//errLog.Log("received a job")
+			go func(job Job) {
+				// try to obtain a worker job channel that is available.
+				// this will block until a worker is idle
+				worker := <-d.WorkerPool
+				//errLog.Log(fmt.Sprintf("wake up worker %d", worker.id))
+				jobChannel := worker.JobChannel
+				// dispatch the job to the worker job channel
+				jobChannel <- job
+			}(job)
+		}
+	}
+}
+
+/* --- mysqlstream --- */
+
+type mysqlStreamFactory struct {
+	source map[string]*mysqlStream
 }
 
 type mysqlStream struct {
@@ -262,7 +387,10 @@ func (m *mysqlStream) handlePacket(seq uint8, payload []byte, srvPackets chan *p
 
 func (m *mysqlStream) runClient(srv chan *packet) {
 	for packet := range m.packets {
-		m.handlePacket(packet.seq, packet.payload, srv)
+		payload := Payload{p: packet, m: m, srv: srv}
+		job := Job{Payload: payload}
+		JobQueue <- job
+		// m.handlePacket(packet.seq, packet.payload, srv)
 	}
 }
 
@@ -270,14 +398,6 @@ func main() {
 	flag.Parse()
 	errLog = utils.NewErrLog()
 	sqlLog = utils.NewSQLLog()
-	sigs := make(chan os.Signal, 1)
-	exit := make(chan bool, 1)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		sig := <-sigs
-		errLog.Log(fmt.Sprintf("received signal: %v", sig))
-		exit <- true
-	}()
 
 	errLog.Log(fmt.Sprintf("Initializing MySQL capture on %s:%d...", *iface, *port))
 	handle, err := pcap.OpenLive(*iface, 65535, false, pcap.BlockForever)
@@ -296,6 +416,22 @@ func main() {
 		os.Exit(1)
 	}
 	//defer handle.Close()
+
+	// start work pool
+	JobQueue = make(chan Job, maxQueue)
+	errLog.Log("Start dispatcher")
+	dispatcher := NewDispatcher(maxWorker)
+	dispatcher.Run()
+
+	// capture exiting signal
+	sigs := make(chan os.Signal, 1)
+	exit := make(chan bool, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-sigs
+		errLog.Log(fmt.Sprintf("received signal: %v", sig))
+		exit <- true
+	}()
 
 	// Set up assembly
 	streamFactory := &mysqlStreamFactory{source: make(map[string]*mysqlStream)}
@@ -325,6 +461,8 @@ func main() {
 			// Every Minus, flush connections that haven't seen activity in the past 2 Minute.
 			assembler.FlushOlderThan(time.Now().Add(time.Minute * -2))
 		case <-exit:
+			errLog.Log("Stop dispatcher")
+			dispatcher.Stop()
 			errLog.Log("exiting")
 			os.Exit(0)
 		}
